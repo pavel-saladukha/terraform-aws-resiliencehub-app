@@ -7,86 +7,198 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 4.11"
+      version = "~> 5.70"
     }
+    awscc = {
+      source  = "hashicorp/awscc"
+      version = "~> 1.20"
+    }
+
   }
 
   required_version = ">= 0.14.9"
 
+}
+
+terraform {
   backend "s3" {
-    bucket = "$BUCKET"
-    key    = "$path/to/file.tfstate"
-    region = "$BUCKET_REGION"
+    bucket         = "tf-state-rhub"
+    key            = "state/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    kms_key_id     = "alias/terraform-bucket-key"
+    dynamodb_table = "terraform-state"
   }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+provider "awscc" {
+  region = "us-east-1"
 }
 
 locals {
-  s3_state_file_url = "https://$BUCKET.s3.$BUCKET_REGION.amazonaws.com/$path/to/file.tfstate"
-  app_name          = "Application-${random_string.session.id}"
+  bucket_name   = "tf-state-rhub"
+  path_to_state = "state/terraform.tfstate"
 }
 
-resource "random_string" "session" {
-  length  = 8
-  special = false
+resource "aws_kms_key" "terraform-bucket-key" {
+  description             = "This key is used to encrypt bucket objects"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
 }
 
-#tfsec:ignore:aws-dynamodb-enable-at-rest-encryption tfsec:ignore:aws-dynamodb-enable-recovery tfsec:ignore:aws-dynamodb-table-customer-key
-resource "aws_dynamodb_table" "ddb_table" {
-  billing_mode = "PAY_PER_REQUEST"
-  name         = "DdbTable-${random_string.session.id}"
+resource "aws_kms_alias" "key-alias" {
+  name          = "alias/terraform-bucket-key"
+  target_key_id = aws_kms_key.terraform-bucket-key.key_id
+}
 
-  hash_key = "key"
-  attribute {
-    name = "key"
-    type = "N"
+resource "aws_s3_bucket" "terraform-state" {
+  bucket = local.bucket_name
+}
+
+resource "aws_s3_bucket_policy" "s3_rhub_state_policy" {
+  bucket = aws_s3_bucket.terraform-state.id
+  policy = data.aws_iam_policy_document.rhub_access.json
+}
+
+data "aws_iam_policy_document" "rhub_access" {
+  statement {
+    principals {
+      type        = "AWS"
+      identifiers = ["${aws_iam_role.rhub_role.arn}"]
+    }
+
+    actions = [
+      "s3:GetObject",
+      "s3:ListBucket",
+    ]
+
+    resources = [
+      aws_s3_bucket.terraform-state.arn,
+      "${aws_s3_bucket.terraform-state.arn}/${local.path_to_state}",
+    ]
   }
 }
 
-#tfsec:ignore:aws-rds-encrypt-instance-storage-data tfsec:ignore:aws-rds-specify-backup-retention tfsec:ignore:aws-rds-enable-performance-insights
-resource "aws_db_instance" "rds_instance" {
-  allocated_storage    = 5
-  engine               = "mysql"
-  engine_version       = "5.7"
-  instance_class       = "db.t3.micro"
-  db_name              = "RDS${random_string.session.id}"
-  username             = "foo"
-  password             = "foobarbaz"
-  parameter_group_name = "default.mysql5.7"
-  skip_final_snapshot  = true
+resource "aws_s3_bucket_server_side_encryption_configuration" "terraform-state" {
+  bucket = aws_s3_bucket.terraform-state.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.terraform-bucket-key.arn
+    }
+  }
 }
 
-module "resiliencehub_app" {
-  app_name = local.app_name
-  source   = "../.."
-  rto      = 300
-  rpo      = 60
-  app_components = [
+resource "aws_dynamodb_table" "terraform-state" {
+  name           = "terraform-state"
+  read_capacity  = 20
+  write_capacity = 20
+  hash_key       = "LockID"
+
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+}
+
+resource "awscc_resiliencehub_app" "rhub" {
+
+  # Required
+  name = "rhub-manual-1"
+  app_template_body = jsonencode(
     {
-      app_component_name = "DynamoDBComponent"
-      app_component_type = "AWS::ResilienceHub::DatabaseAppComponent"
-      resources = [
-        {
-          resource_name            = "DynamoDBTable"
-          resource_type            = "AWS::DynamoDB::Table"
-          resource_identifier      = aws_dynamodb_table.ddb_table.id
-          resource_identifier_type = "Native"
-          resource_region          = "us-west-2"
-        }
-      ]
-    },
-    {
-      app_component_name = "RdsComponent"
-      app_component_type = "AWS::ResilienceHub::DatabaseAppComponent"
-      resources = [
-        {
-          resource_name            = "RdsInstance"
-          resource_type            = "AWS::RDS::DBInstance"
-          resource_identifier      = aws_db_instance.rds_instance.id
-          resource_identifier_type = "Native"
-          resource_region          = "us-west-2"
-        }
-      ]
     }
+  )
+  resource_mappings = [
+    {
+      mapping_type = "Terraform"
+      physical_resource_id = {
+        identifier = "s3://${local.bucket_name}/${local.path_to_state}"
+        type       = "Native"
+      }
+      terraform_source_name = "terraform.tfstate"
+    },
   ]
-  s3_state_file_url = local.s3_state_file_url
+
+  # Optional
+  app_assessment_schedule = "Disabled"
+  permission_model = {
+    invoker_role_name = "rhub_role"
+    type              = "RoleBased"
+  }
+
+  # resiliency_policy_arn = data.aws_iam_policy.rhub-managed-policy.arn
+}
+
+resource "aws_iam_role" "rhub_role" {
+  name = "rhub_role"
+
+  assume_role_policy = jsonencode({
+    "Version" : "2012-10-17"
+    "Statement" : [
+      {
+        "Action" : "sts:AssumeRole"
+        "Effect" : "Allow"
+        "Sid" : ""
+        "Principal" : {
+          "Service" : "resiliencehub.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+data "aws_iam_policy" "rhub-managed-policy" {
+  name = "AWSResilienceHubAsssessmentExecutionPolicy"
+}
+
+resource "aws_iam_policy" "rhub_policy" {
+  name        = "rhub_policy"
+  path        = "/"
+  description = "rhub policy"
+
+  policy = jsonencode({
+    "Version" : "2012-10-17"
+    "Statement" : [
+      {
+        "Effect" : "Allow",
+        "Action" : "s3:GetObject",
+        "Resource" : "arn:aws:s3:::${local.bucket_name}/${local.path_to_state}"
+      },
+      {
+        "Effect" : "Allow",
+        "Action" : "s3:ListBucket",
+        "Resource" : "arn:aws:s3:::${local.bucket_name}"
+      },
+      {
+        "Effect" : "Allow",
+        "Action" : [
+          "kms:Decrypt",
+        ],
+        "Resource" : aws_kms_key.terraform-bucket-key.arn
+      },
+      {
+        "Effect" : "Allow",
+        "Action" : [
+          "dynamodb:DescribeTable",
+        ],
+        "Resource" : aws_dynamodb_table.terraform-state.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "rhub-attach" {
+  role       = aws_iam_role.rhub_role.name
+  policy_arn = aws_iam_policy.rhub_policy.arn
+}
+
+resource "aws_iam_role_policy_attachment" "rhub-managed-attach" {
+  role       = aws_iam_role.rhub_role.name
+  policy_arn = data.aws_iam_policy.rhub-managed-policy.arn
 }
